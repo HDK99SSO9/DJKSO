@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Морской бой онлайн</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 0; background: #eef; }
+    #login, #game { max-width: 500px; margin: 50px auto; }
+    select, input, button { padding: 8px; font-size: 1em; margin: 5px; }
+    #boards { display: flex; justify-content: space-around; margin-top: 20px; }
+    .grid { display: grid; grid-template: repeat(10,30px) / repeat(10,30px); gap: 2px; }
+    .cell { width:30px; height:30px; border:1px solid #333; line-height:30px; cursor: pointer; }
+    .ship { background: #999; }
+    .hit  { background: red; }
+    .miss { background: #4af; }
+    #status { margin-top: 20px; font-weight: bold; }
+  </style>
+
+  <!-- Brython (Python в браузере) -->
+  <script src="https://cdn.jsdelivr.net/npm/brython@3.9.5/brython.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/brython@3.9.5/brython_stdlib.min.js"></script>
+
+  <!-- Firebase v9 compat для Realtime Database -->
+  <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-database-compat.js"></script>
+</head>
+<body onload="brython()">
+
+  <!-- Окно логина -->
+  <div id="login">
+    <h2>Авторизация</h2>
+    <!-- Вместо свободного поля — выбор из двух готовых пользователей -->
+    <select id="username">
+      <option value="user1">user1</option>
+      <option value="user2">user2</option>
+    </select>
+    <input id="gameId" placeholder="ID комнаты (любая строка)">
+    <button id="joinBtn">Войти</button>
+  </div>
+
+  <!-- Основное окно игры -->
+  <div id="game" style="display:none;">
+    <h2 id="greet"></h2>
+    <div id="status">Соединение…</div>
+    <div id="boards" style="display:none;">
+      <div>
+        <h3>Ваше поле</h3>
+        <div id="myBoard" class="grid"></div>
+      </div>
+      <div>
+        <h3>Поле противника</h3>
+        <div id="enemyBoard" class="grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firebase init -->
+  <script>
+    // TODO: замените на ваши ключи из Firebase Console → Realtime Database
+    const firebaseConfig = {
+      apiKey: "...",
+      authDomain: "...",
+      databaseURL: "https://<YOUR-PROJECT>.firebaseio.com",
+      projectId: "...",
+      storageBucket: "...",
+      messagingSenderId: "...",
+      appId: "..."
+    };
+    firebase.initializeApp(firebaseConfig);
+  </script>
+
+  <!-- Игра на Brython -->
+  <script type="text/python">
+from browser import document, html
+import random, json
+from js import firebase
+
+username = None
+game_id = None
+my_board = []; enemy_board = []
+my_ships = set()
+my_turn = False
+
+def build_grid(container, click_cb=None):
+    grid = []
+    for y in range(10):
+        row = []
+        for x in range(10):
+            cell = html.DIV(Class="cell")
+            cell.attrs["data-x"], cell.attrs["data-y"] = x, y
+            if click_cb:
+                cell.bind("click", click_cb)
+            container <= cell
+            row.append(cell)
+        grid.append(row)
+    return grid
+
+def place_ships():
+    while len(my_ships) < 5:
+        x, y = random.randrange(10), random.randrange(10)
+        if (x,y) not in my_ships:
+            my_ships.add((x,y))
+            my_board[y][x].classList.add("ship")
+
+def on_fire(ev):
+    global my_turn
+    if not my_turn: return
+    x = int(ev.target.attrs["data-x"]); y = int(ev.target.attrs["data-y"])
+    move = {"x": x, "y": y, "player": username}
+    firebase.database().ref(f"games/{game_id}/moves").push(json.dumps(move))
+    my_turn = False
+
+def listen_moves(_):
+    global my_turn
+    moves_ref = firebase.database().ref(f"games/{game_id}/moves")
+    def cb(snapshot):
+        moves = snapshot.val() or {}
+        for m_json in moves.values():
+            m = json.loads(m_json)
+            if m["player"] != username:
+                x,y = m["x"], m["y"]
+                hit = (x,y) in my_ships
+                cell = my_board[y][x]
+                cell.classList.add("hit" if hit else "miss")
+                resp = {"x": x, "y": y, "hit": hit, "player": username}
+                firebase.database().ref(f"games/{game_id}/responses").push(json.dumps(resp))
+                document["status"].text = f"Ход противника: {'попадание' if hit else 'промах'} в ({x},{y})"
+                my_turn = True
+    moves_ref.listen(cb)
+
+def listen_responses(_):
+    resp_ref = firebase.database().ref(f"games/{game_id}/responses")
+    def cb(snapshot):
+        responses = snapshot.val() or {}
+        for r_json in responses.values():
+            r = json.loads(r_json)
+            if r["player"] != username:
+                x,y,hit = r["x"], r["y"], r["hit"]
+                cell = enemy_board[y][x]
+                cell.classList.add("hit" if hit else "miss")
+                document["status"].text = f"Ваш ход: {'попадание' if hit else 'промах'} в ({x},{y})"
+    resp_ref.listen(cb)
+
+def decide_first(snap):
+    players = list((snap.val() or {}).keys())
+    global my_turn
+    if players and players[0] == username:
+        my_turn = True
+        document["status"].text = "Ваш ход"
+    else:
+        my_turn = False
+        document["status"].text = "Ход противника"
+
+def start_game(_):
+    global username, game_id, my_board, enemy_board
+    username = document["username"].value
+    game_id = document["gameId"].value.strip()
+    if not username or not game_id: return
+
+    document["login"].style.display = "none"
+    document["game"].style.display = "block"
+    document["greet"].text = f"Вы: {username}, комната: {game_id}"
+
+    my_board     = build_grid(document["myBoard"])
+    enemy_board  = build_grid(document["enemyBoard"], on_fire)
+    place_ships()
+    document["boards"].style.display = "flex"
+
+    # регистрируемся в комнате и решаем, кто первый
+    firebase.database().ref(f"games/{game_id}/players/{username}").set(True)
+    firebase.database().ref(f"games/{game_id}/players")\
+            .once("value", lambda snap: decide_first(snap))
+
+    listen_moves(None)
+    listen_responses(None)
+
+document["joinBtn"].bind("click", start_game)
+  </script>
+</body>
+</html>
